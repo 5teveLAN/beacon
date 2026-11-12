@@ -59,7 +59,10 @@ if [ "$EUID" -ne 0 ] && [ "${SETUP_SYSTEM_ALLOW_NONROOT:-0}" != "1" ]; then
     exit 1
 fi
 
-SERVICE_GROUP="${SERVICE_GROUP:-$(id -gn "${SERVICE_USER}" 2>/dev/null || echo "${SERVICE_USER}")}"
+# ⚠️ 不要 fallback 成使用者的「主群組」：BLE 掃描需要 bluetooth 群組的
+#    D-Bus 權限，主群組通常不是 bluetooth。SERVICE_GROUP 留空 = 只用主群組，
+#    只有當 SERVICE_USER 就是 bluetooth 群組成員時才安全（下面會檢查並警告）。
+SERVICE_GROUP="${SERVICE_GROUP:-}"
 VENV_PYTHON="${APP_DIR}/venv/bin/python3"
 
 step() { echo ""; echo "── $* ──"; }
@@ -94,12 +97,20 @@ fi
 
 # ─── 3. 權限 ─────────────────────────────────
 step "設定 ${SERVICE_USER} 的 BLE 權限"
-if id "${SERVICE_USER}" &>/dev/null; then
-    if ! id -nG "${SERVICE_USER}" | tr ' ' '\n' | grep -qx bluetooth; then
-        usermod -aG bluetooth "${SERVICE_USER}"
-        echo "   已將 ${SERVICE_USER} 加入 bluetooth 群組（下次登入生效；服務會 restart 所以不影響）"
-    else
+if [ "${SERVICE_USER}" = "root" ]; then
+    echo "   服務以 root 執行，D-Bus 權限充足，不需 bluetooth 群組。"
+elif id "${SERVICE_USER}" &>/dev/null; then
+    if id -nG "${SERVICE_USER}" | tr ' ' '\n' | grep -qx bluetooth; then
         echo "   ${SERVICE_USER} 已在 bluetooth 群組。"
+    else
+        usermod -aG bluetooth "${SERVICE_USER}"
+        echo "   已將 ${SERVICE_USER} 加入 bluetooth 群組"
+    fi
+    # 服務由 systemd 直接 fork，會讀到最新的群組資料庫，不需重新登入；
+    # 但「互動 shell」要重新登入才看得到，所以這裡明確講清楚。
+    if ! id -nG "${SERVICE_USER}" | tr ' ' '\n' | grep -qx bluetooth; then
+        echo "   ⚠️ 群組設定似乎未生效；若掃描出現 org.bluez.Error.NotPermitted："
+        echo "      sudo usermod -aG bluetooth ${SERVICE_USER} && sudo systemctl restart ${SERVICE_NAME}"
     fi
 else
     echo "   ⚠️ 使用者 ${SERVICE_USER} 不存在，略過群組設定。"
@@ -128,9 +139,27 @@ if [ "${INSTALL_UNIT}" = "1" ]; then
         SERVICE_FILE="${HOME}/stub-etc/systemd/system/${SERVICE_NAME}.service"
     fi
     mkdir -p "$(dirname "${SERVICE_FILE}")"
-    if [ ! -x "${VENV_PYTHON}" ]; then
-        echo "   ⚠️ ${VENV_PYTHON} 不存在（venv 尚未建立）；unit 仍會寫入，等 venv 就緒後再 restart。"
+    if [ ! -f "${VENV_PYTHON}" ] || ! "${VENV_PYTHON}" -c 'import sys' >/dev/null 2>&1; then
+        echo "   ⚠️ ${VENV_PYTHON} 不存在或不可執行（venv 尚未建立）；unit 仍會寫入，等 venv 就緒後再 restart。"
     fi
+
+    # bluetoothctl 的實際路徑（某些發行版/容器不在 /usr/bin）
+    BTCTL="$(command -v bluetoothctl 2>/dev/null || true)"
+    if [ -z "${BTCTL}" ]; then
+        BTCTL="/usr/bin/bluetoothctl"
+    fi
+    if [ ! -x "${BTCTL}" ]; then
+        echo "   ⚠️ 找不到 bluetoothctl（unit 的 ExecStopPost 會是 no-op；org.bluez.Error.InProgress 可能復發）"
+        echo "      修正： sudo apt install bluez"
+    fi
+
+    # Group= 只在有指定時才寫（空字串會讓 systemd 報錯）
+    if [ -n "${SERVICE_GROUP}" ]; then
+        UNIT_GROUP_LINE="Group=${SERVICE_GROUP}"
+    else
+        UNIT_GROUP_LINE="# Group= 未指定（沿用 User 的主群組；BLE 掃描可能回 NotPermitted）"
+    fi
+
     cat > "${SERVICE_FILE}" <<EOF
 [Unit]
 Description=BLE Beacon Scanner – scans BLE advertisements and publishes via MQTT
@@ -140,22 +169,23 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=${SERVICE_USER}
-Group=${SERVICE_GROUP}
+${UNIT_GROUP_LINE}
 WorkingDirectory=${APP_DIR}
 ExecStart=${VENV_PYTHON} -u ${APP_DIR}/code.py
 # 服務結束（重啟、crash、stop）時把 adapter 上殘留的 discovery 收乾淨。
 # 不做這件事，下一輪 StartDiscovery 會撞 org.bluez.Error.InProgress
 # （"Operation already in progress"），也就是 log 一直洗版的來源。
-ExecStopPost=-/usr/bin/bluetoothctl --timeout 3 scan off
+ExecStopPost=-${BTCTL} --timeout 3 scan off
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    echo "   已寫入 ${SERVICE_FILE} (User=${SERVICE_USER})"
+    echo "   已寫入 ${SERVICE_FILE} (User=${SERVICE_USER}${SERVICE_GROUP:+, Group=${SERVICE_GROUP}})"
     systemctl daemon-reload
     systemctl enable "${SERVICE_NAME}" >/dev/null 2>&1
     echo "   已 enable ${SERVICE_NAME}"
@@ -222,27 +252,48 @@ cat > "${UNSTUCK_SCRIPT}" <<'EOF'
 # 這裡只在「真的卡住」時動作，正常掃描中斷的 3 秒窗口不會被誤判。
 set -u
 
-DISCOVERING="$(busctl --system get-property org.bluez /org/bluez/hci0 \
-                 org.bluez.Adapter1 Discovering 2>/dev/null | awk '{print $2}')"
+# 自動偵測 adapter（可能是 hci0 / hci1…；不要寫死 hci0，否則 USB dongle
+# 或內建藍牙被 rename 時整個 timer 會靜默失效）
+ADAPTER_PATH=""
+if command -v busctl >/dev/null 2>&1; then
+    for p in /org/bluez/hci0 /org/bluez/hci1 /org/bluez/hci2; do
+        if busctl --system get-property org.bluez "${p}" \
+                org.bluez.Adapter1 Powered >/dev/null 2>&1; then
+            ADAPTER_PATH="${p}"
+            break
+        fi
+    done
+fi
+if [ -z "${ADAPTER_PATH}" ]; then
+    # 沒有 adapter / busctl 不可用 → 什麼都不做（避免誤 power cycle）
+    exit 0
+fi
+ADAPTER_NAME="${ADAPTER_PATH##*/}"
+
+get_discovering() {
+    busctl --system get-property org.bluez "${ADAPTER_PATH}" \
+        org.bluez.Adapter1 Discovering 2>/dev/null | awk '{print $2}'
+}
+
+DISCOVERING="$(get_discovering)"
 
 case "${DISCOVERING}" in
     true)
         # adapter 卡在 scanning：先試單純 stop，失敗才 power cycle
-        bluetoothctl --timeout 3 scan off >/dev/null 2>&1
+        BTCTL="$(command -v bluetoothctl 2>/dev/null || echo bluetoothctl)"
+        "${BTCTL}" --timeout 3 scan off >/dev/null 2>&1
         sleep 1
-        STILL="$(busctl --system get-property org.bluez /org/bluez/hci0 \
-                   org.bluez.Adapter1 Discovering 2>/dev/null | awk '{print $2}')"
-        if [ "${STILL}" = "true" ]; then
-            echo "ble-unstuck: discovery 卡住，power cycle hci0"
-            bluetoothctl --timeout 3 power off >/dev/null 2>&1
+        if [ "$(get_discovering)" = "true" ]; then
+            echo "ble-unstuck: ${ADAPTER_NAME} discovery 卡住，power cycle"
+            "${BTCTL}" --timeout 3 power off >/dev/null 2>&1
             sleep 2
-            bluetoothctl --timeout 3 power on  >/dev/null 2>&1
+            "${BTCTL}" --timeout 3 power on  >/dev/null 2>&1
         else
-            echo "ble-unstuck: StopDiscovery 後恢復"
+            echo "ble-unstuck: ${ADAPTER_NAME} StopDiscovery 後恢復"
         fi
         ;;
     false|"")
-        # false = 正常；空字串 = 沒有 adapter / busctl 失敗，什麼都不做
+        # false = 正常；空字串 = adapter 暫時讀不到，什麼都不做
         ;;
     *)
         ;;

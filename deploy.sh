@@ -142,7 +142,9 @@ while IFS= read -r line || [ -n "${line}" ]; do
     [ -z "${line}" ] && continue
 
     read -r target no <<<"${line}"
-    [ -z "${no:-}" ] && no="${line_no}"
+    if [ -z "${no:-}" ]; then
+        no="${line_no}"
+    fi
     [[ "${no}" =~ ^[0-9]+$ ]] || die "hosts.txt 第 ${line_no} 行的 RECEIVER_NO 不是數字: ${no}"
 
     if [ "${#FILTERS[@]}" -gt 0 ]; then
@@ -173,11 +175,16 @@ if [ "${PRINT_SUDO:-0}" = "1" ]; then
         _t="${entry%|*}"
         _hosts="${_hosts} ${_t}"
         _u="${_t%@*}"
-        [ "${_u}" = "${_t}" ] && _u="${USER}"
+        if [ "${_u}" = "${_t}" ]; then
+            _u="${USER}"
+        fi
         echo "  ssh ${_t} \"echo '${_u} ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/010-${_u}-deploy && sudo chmod 440 /etc/sudoers.d/010-${_u}-deploy\""
     done
     # 迴圈版用第一台的帳號名（慣例上三台相同）
-    _u="${TARGETS[0]%|*}"; _u="${_u%@*}"; [ "${_u}" = "${TARGETS[0]%|*}" ] && _u="${USER}"
+    _u="${TARGETS[0]%|*}"; _u="${_u%@*}"
+    if [ "${_u}" = "${TARGETS[0]%|*}" ]; then
+        _u="${USER}"
+    fi
     echo
     echo "# 方式 2：一行迴圈版"
     echo "  for h in${_hosts}; do ssh \"\$h\" \"echo '${_u} ALL=(ALL) NOPASSWD:ALL' | sudo tee /etc/sudoers.d/010-${_u}-deploy && sudo chmod 440 /etc/sudoers.d/010-${_u}-deploy\"; done"
@@ -275,7 +282,7 @@ deploy_one() {
     [dry-run] my_secrets.py : RECEIVER_NO=${receiver_no} → ${LINK_DESC} topic=${MQTT_TOPIC}
     [dry-run] venv          : ${show_dir}/venv  (pip install -r requirements.txt)
     [dry-run]               : requirements.txt 只含 bleak + paho-mqtt（常駐服務用）
-    [dry-run] sudo bash setup-system.sh --dir ${show_dir} --user <ssh user>
+    [dry-run] sudo bash setup-system.sh --dir ${show_dir} --user <ssh user> --group bluetooth
     [dry-run] systemctl restart ble-beacon-scanner + 健康檢查
 EOF
         return 0
@@ -309,7 +316,9 @@ EOF
         *[\'\"\ \\$]*) warn "遠端目錄含引號/空白/\$，請改用不含這些字元的路徑: ${remote_dir}"; return 1 ;;
     esac
     remote_user="${target%@*}"
-    [ "${remote_user}" = "${target}" ] && remote_user="$(ssh ${SSH_OPTS} -p "${SSH_PORT}" "${target}" 'id -un')"
+    if [ "${remote_user}" = "${target}" ]; then
+        remote_user="$(ssh ${SSH_OPTS} -p "${SSH_PORT}" "${target}" 'id -un')"
+    fi
 
     # 2) 推程式碼（排除本機 venv / secrets / 快取 / 部署產物）
     ssh ${SSH_OPTS} -p "${SSH_PORT}" "${target}" "mkdir -p '${remote_dir}'" \
@@ -340,7 +349,9 @@ EOF
     # 記錄版號：每一台 .deployed 寫下 commit/時間/參數，remote 沒 git 也能查
     local rev deployed_at
     rev="$(git -C "${SCRIPT_DIR}" rev-parse --short HEAD 2>/dev/null || echo nogit)"
-    [ -n "$(git -C "${SCRIPT_DIR}" status --porcelain 2>/dev/null)" ] && rev="${rev}+dirty"
+    if [ -n "$(git -C "${SCRIPT_DIR}" status --porcelain 2>/dev/null)" ]; then
+        rev="${rev}+dirty"
+    fi
     deployed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     ssh ${SSH_OPTS} -p "${SSH_PORT}" "${target}" \
         "printf '%s\n' 'rev=${rev}' 'deployed_at=${deployed_at}' 'receiver_no=${receiver_no}' 'broker=${LINK_DESC}' 'topic=${MQTT_TOPIC}' > '${remote_dir}/.deployed'" \
@@ -350,13 +361,23 @@ EOF
     if ! ssh ${SSH_OPTS} -p "${SSH_PORT}" "${target}" bash -s -- "${remote_dir}" >>"${log_file}" 2>&1 <<'REMOTE'
 set -euo pipefail
 cd "$1"
-if [ ! -x venv/bin/python3 ]; then
+
+# venv 必須「真的能跑」，只用 -x 判斷會被 symlink 誤導
+if [ ! -f venv/bin/python3 ] || ! venv/bin/python3 -c 'import sys' >/dev/null 2>&1; then
+    echo ">>> 建立 venv"
     python3 -m venv --help >/dev/null 2>&1 || {
         echo "ERROR: python3-venv 未安裝（先跑一次 sudo setup-system.sh）" >&2; exit 1; }
+    rm -rf venv
     python3 -m venv venv
 fi
-venv/bin/pip3 install -q --upgrade pip
-venv/bin/pip3 install -q -r requirements.txt
+
+# ⚠️ 有些 venv 只有 pip、沒有 pip3；寫死 pip3 會直接失敗
+VENV_PIP=venv/bin/pip
+[ -x "$VENV_PIP" ] || VENV_PIP=venv/bin/pip3
+[ -x "$VENV_PIP" ] || { echo "ERROR: venv 內找不到 pip/pip3" >&2; exit 1; }
+
+"$VENV_PIP" install -q --upgrade pip
+"$VENV_PIP" install -q -r requirements.txt
 # 驗證：code.py 需要的 import 都能成立（bleak 3.x 沒有 __version__，改用 importlib.metadata）
 venv/bin/python3 - <<'PY'
 import importlib.metadata as md
@@ -397,8 +418,11 @@ REMOTE
     ok "venv 與 requirements.txt 就緒"
 
     # 5) 系統層設定（BlueZ / bluetooth 群組 / systemd unit）；需要免密碼 sudo
+    #    --group bluetooth：BLE 掃描要靠 bluetooth 群組取得 BlueZ D-Bus 權限。
+    #    不帶的話 setup-system.sh 會沿用使用者主群組，掃描會回
+    #    org.bluez.Error.NotPermitted（不是程式問題，是權限）。
     if ! ssh ${SSH_OPTS} -p "${SSH_PORT}" "${target}" \
-            "sudo -n bash -s -- --dir '${remote_dir}' --user '${remote_user}'" \
+            "sudo -n bash -s -- --dir '${remote_dir}' --user '${remote_user}' --group bluetooth" \
             < "${SCRIPT_DIR}/setup-system.sh" >>"${log_file}" 2>&1; then
         if grep -q 'sudo: a password is required\|interactive authentication' "${log_file}" 2>/dev/null; then
             warn "需要免密碼 sudo（deploy.sh 用 sudo -n，不會卡在密碼提示）。在 ${target} 上執行："
@@ -434,6 +458,13 @@ REMOTE
     if [ "${state}" != "active" ]; then
         warn "服務狀態 = ${state}（未啟動）"
         printf '%s\n' "${health}" | tail -15 | sed 's/^/    /' >&2 || true
+        # 最常見的啟動失敗：套件裝在別的 Python（No module named ...）
+        if printf '%s\n' "${health}" | grep -q "No module named"; then
+            log  "  原因：套件沒進到 ${remote_dir}/venv。在 ${target} 上修："
+            log  "    cd ${remote_dir} && venv/bin/pip install -r requirements.txt"
+            log  "    sudo systemctl restart ble-beacon-scanner"
+            log  "  診斷：cd ${remote_dir} && ./diagnose_paho.sh"
+        fi
         return 1
     fi
     if printf '%s\n' "${health}" | grep -qE 'Starting BLE scan|Successfully connected to MQTT|MQTT|學號'; then
