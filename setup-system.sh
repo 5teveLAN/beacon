@@ -19,6 +19,8 @@
 #   7. 安裝 /usr/local/bin/ble-unstuck.sh + ble-unstuck.timer
 #      —— 每 5 分鐘檢查 adapter 是否卡在 Discovering=true；
 #         卡住才動作（stop → power cycle），用來解 org.bluez.Error.InProgress
+#   8. 安裝 /usr/local/bin/diagnose_paho.sh
+#      —— 「No module named 'paho'」這類「裝到錯的 Python」問題的診斷工具
 #
 # 為什麼需要 4/6/7（見 code.py 的 BLE bleak error）：
 #   org.bluez.Error.InProgress（"Operation already in progress"）是 BlueZ
@@ -276,5 +278,23 @@ if command -v systemctl >/dev/null 2>&1; then
         echo "   ⚠️ 無法 enable ble-unstuck.timer（稍後手動 systemctl enable --now ble-unstuck.timer）"
 fi
 echo "   已安裝 ${UNSTUCK_SCRIPT} + ble-unstuck.timer（每 5 分鐘檢查一次）"
+
+# ─── 7. 診斷工具 ───────────────────────────────────────────────
+# 「No module named 'paho'」幾乎都是「套件裝到系統 Python，但服務用 venv」
+# 造成的。把診斷腳本放到 PATH 裡，出問題時直接跑 diagnose_paho.sh 即可。
+step "安裝 diagnose_paho.sh（依賴安裝問題診斷）"
+DIAG_SRC="${APP_DIR}/diagnose_paho.sh"
+DIAG_DST="/usr/local/bin/diagnose_paho.sh"
+if [ "${SETUP_SYSTEM_ALLOW_NONROOT:-0}" = "1" ]; then
+    DIAG_DST="${HOME}/stub-usr/local/bin/diagnose_paho.sh"
+fi
+if [ -f "${DIAG_SRC}" ]; then
+    mkdir -p "$(dirname "${DIAG_DST}")"
+    install -m 755 "${DIAG_SRC}" "${DIAG_DST}" 2>/dev/null \
+        && echo "   已安裝 ${DIAG_DST}" \
+        || echo "   ⚠️ 無法安裝 ${DIAG_DST}（可直接執行 ${DIAG_SRC}）"
+else
+    echo "   ⚠️ 找不到 ${DIAG_SRC}，略過。"
+fi
 
 step "系統層設定完成"

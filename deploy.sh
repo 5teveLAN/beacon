@@ -271,7 +271,7 @@ deploy_one() {
     [dry-run] 目標目錄      : ${show_dir}（遠端絕對路徑）
     [dry-run] rsync         : code.py get_exponent.py requirements.txt setup-system.sh
                               requirements-measure.txt install_systemd.sh
-                              debug_output.sh my_secrets.py.tmpl
+                              debug_output.sh my_secrets.py.tmpl diagnose_paho.sh
     [dry-run] my_secrets.py : RECEIVER_NO=${receiver_no} → ${LINK_DESC} topic=${MQTT_TOPIC}
     [dry-run] venv          : ${show_dir}/venv  (pip install -r requirements.txt)
     [dry-run]               : requirements.txt 只含 bleak + paho-mqtt（常駐服務用）
@@ -360,8 +360,17 @@ venv/bin/pip3 install -q -r requirements.txt
 # 驗證：code.py 需要的 import 都能成立（bleak 3.x 沒有 __version__，改用 importlib.metadata）
 venv/bin/python3 - <<'PY'
 import importlib.metadata as md
-import bleak  # noqa: F401
-import paho.mqtt.client  # noqa: F401
+import sys
+print("python:", sys.executable)
+try:
+    import bleak  # noqa: F401
+    import paho.mqtt.client  # noqa: F401
+except ModuleNotFoundError as e:
+    # 明確指出「哪個 Python 少了哪個套件」——只印 traceback 很容易被誤認成
+    # 裝到系統 Python 去了（No module named 'paho' 的經典來源）
+    print(f"ERROR: {sys.executable} 缺少套件：{e}", file=sys.stderr)
+    print("       請確認是用 venv/bin/pip 安裝，不是 pip3 install。", file=sys.stderr)
+    raise
 print("deps ok: bleak", md.version("bleak"), "/ paho-mqtt", md.version("paho-mqtt"))
 PY
 REMOTE
@@ -374,6 +383,12 @@ REMOTE
                  "的 wheel，pip 正在現場編譯但缺少 swig。"
             log  "  requirements.txt 只該包含常駐服務需要的 bleak / paho-mqtt；"
             log  "  若你剛把 adafruit-blinka 加回來，請改放到 requirements-measure.txt。"
+        elif grep -q "No module named 'paho'\|No module named 'bleak'" "${log_file}" 2>/dev/null; then
+            log  "  原因：套件沒進到 ${remote_dir}/venv（多半是裝到系統 Python 或 ~/.local）。"
+            log  "  在 ${target} 上修："
+            log  "    cd ${remote_dir} && venv/bin/pip install -r requirements.txt"
+            log  "    sudo systemctl restart ble-beacon-scanner"
+            log  "  想先確認裝到哪去了：cd ${remote_dir} && ./diagnose_paho.sh"
         elif grep -q 'No matching distribution\|Could not find a version' "${log_file}" 2>/dev/null; then
             log  "  原因：PyPI 上找不到對應此 Python 版本 / 架構的套件版本。"
         fi
