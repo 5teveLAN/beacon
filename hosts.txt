@@ -1,0 +1,10 @@
+# 三台樹莓派的清單：<SSH 連線目標> 或 <SSH 連線目標> <RECEIVER_NO>
+#   連線目標 = anything ssh(1) 認得的東西：pi@raspi-1.local、ubnt@192.168.1.21、
+#             或是 ~/.ssh/config 裡的 Host 別名。
+#   沒寫 RECEIVER_NO 就用行號（第 1 行 → 1）。
+#   RECEIVER_NO 決定 MQTT topic：<topic>/receivers/<n>，三台必須不同。
+ggd@192.168.31.101           1
+ggd@192.168.31.102           2
+# ggd@192.168.31.103           3
+ggd@10.236.28.229 3
+# ubnt@192.168.1.24         4

@@ -1,0 +1,26 @@
+# beacons（樹莓派 BLE 掃描節點）相依套件
+# 安裝：python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+#       （需 Python >= 3.10）
+#
+# 系統套件（BlueZ / D-Bus，pip 裝不到）：
+#       sudo apt install bluetooth bluez libglib2.0-dev
+#       sudo systemctl enable --now bluetooth
+#       且執行帳號需在 bluetooth 群組：sudo usermod -aG bluetooth "$USER"
+#       （服務以 root 執行則免）
+# Linux 上 bleak 走 BlueZ D-Bus（dbus-fast，pip 會自動帶進來）。
+#
+# 這份檔案只放「常駐服務 code.py 真正需要的東西」，deploy.sh 會安裝它。
+# 量測工具 get_exponent.py 的相依在 requirements-measure.txt（選用，
+# 不要在部署時安裝 —— adafruit-blinka 在 Linux 上會拉進 lgpio / rpi_ws281x，
+# 這兩者在 Python 3.13 沒有 wheel，需要現場編譯且必須先裝 swig）。
+
+# ─── code.py：BLE active scan + MQTT 發布 ─────────────────────────
+# bleak 3.1：藍牙主動掃描（BlueZ）。
+#   * >= 2.0 才有 BleakScanner(detection_callback=..., scanning_mode="active")
+#   * >= 3.1.0 修掉 StopDiscovery 時的 InProgress 自動恢復（bleak #2021）
+#     —— 也就是 log 一直出現 "Operation already in progress" 的來源。
+#     純 Python wheel（py3-none-any），部署時不需現場編譯。
+#     Linux 上會拉進 dbus-fast（>=4，需 Python >= 3.10）。
+bleak>=3.1
+# paho-mqtt 2.x：MQTT over WebSocket / TLS（wss），code.py 用 CallbackAPIVersion.VERSION1。
+paho-mqtt>=2.1

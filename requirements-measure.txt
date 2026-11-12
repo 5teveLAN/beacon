@@ -1,0 +1,19 @@
+# get_exponent.py（RSSI → 路徑損耗指數 n 的量測工具）專用相依
+#
+# 這是「選用」檔案：只是在樹莓派上手動跑一次量測時才需要，
+# deploy.sh 不會安裝它。常駐服務請用 requirements.txt。
+#
+# ⚠ adafruit-blinka 在 Linux 上會連帶拉進 lgpio 與 rpi_ws281x。
+#   這兩者目前（lgpio 0.2.2.0）只提供到 CPython 3.12 的預編譯 wheel，
+#   在 Python 3.13+ 需要現場編譯，必須先安裝 swig 與開發標頭：
+#
+#       sudo apt install -y swig python3-dev libgpiod-dev
+#       .venv/bin/pip install -r requirements-measure.txt
+#
+#   若遇到 "swig failed: No such file or directory"，就是漏了上面的 apt 步驟。
+#
+# adafruit_ble 必須在 Linux 上透過 Blinka 的 Linux 後端跑；
+# 只寫 adafruit-blinka，版號由 adafruit-circuitpython-ble 帶出即可，
+# 但兩者都明確列出比較不容易因為解析結果不同而踩雷。
+adafruit-blinka>=9.0
+adafruit-circuitpython-ble>=10.0

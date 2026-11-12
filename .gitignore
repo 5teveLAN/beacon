@@ -1,2 +1,8 @@
 __pycache__
 my_secrets.py
+
+# 部署產物（deploy.sh）
+.deploy-logs/
+.env.deploy
+.deployed
+*.swp
