@@ -131,8 +131,29 @@ def _mqtt_proto_name() -> str:
     return "mqtts" if MQTT_USE_TLS else "mqtt"
 
 
-# client_id 必須唯一：同 id 的新連線會把舊的踢掉（互踢風暴）。
-MQTT_CLIENT_ID = f"beacon-receiver-{RECEIVER_NO}-{_socket.gethostname()[:20]}"
+# ─── MQTT client_id ───────────────────────────
+# ⚠️ RC=2（Identifier Rejected）的常見原因：client_id 太長或含非法字元。
+#   MQTT 3.1   ：client_id 上限 **23 個字元**，只允許 [0-9A-Za-z]
+#   MQTT 3.1.1 ：上限 65535，但部分 broker（mosquitto 舊版、橋接、雲端
+#                SaaS）仍會限制或直接拒絕；也有 broker 不接受空字串。
+#   舊寫法 `beacon-receiver-{n}-{hostname[:20]}` 在樹莓派上很容易超過 23
+#   （例：beacon-receiver-1-raspberrypi = 29），於是連線直接被拒。
+# 這裡改成「短、純英數、且三台保證唯一」的格式：
+#   bcn<n>-<hostname 去除非英數字，最多 10 碼>   例：bcn1-raspberry
+def _safe_client_id(receiver_no) -> str:
+    host = "".join(ch for ch in _socket.gethostname() if ch.isalnum())
+    if not host:
+        # 極端情況（hostname 全是符號）：用 MAC 末碼保證唯一
+        import uuid
+        host = uuid.getnode() & 0xFFFF
+        host = f"{host:04x}"
+    cid = f"bcn{receiver_no}-{host[:10]}"
+    # 保險：再長也不超過 23；空值時給固定字串
+    cid = cid[:23] or "bcn-scanner"
+    return cid
+
+
+MQTT_CLIENT_ID = _safe_client_id(RECEIVER_NO)
 
 # VERSION1 沿用既有 handler 簽章（rc 為 int），與 indoor-locator 一致。
 mqtt_client = paho_mqtt.Client(
@@ -155,10 +176,34 @@ if MQTT_USE_TLS:
 MQTT_RC_MEANING = {
     0: "連線成功",
     1: "MQTT 版本不被接受",
-    2: "client identifier 被拒絕",
+    2: "client identifier 被拒絕",   # client_id 太長 / 含非法字元 / 空字串
     3: "broker 無法使用",
-    4: "帳號或密碼錯誤",           # 常見：username / password 打錯
-    5: "未授權（Not Authorized）",  # 常見：ACL 不允許這個帳號，或密碼錯
+    4: "帳號或密碼錯誤",             # 常見：username / password 打錯
+    5: "未授權（Not Authorized）",    # 常見：ACL 不允許這個帳號，或密碼錯
+}
+
+# 每個 rc 對應的「我該去查什麼」—— 只印 rc 數字沒法排查
+MQTT_RC_HINT = {
+    1: [
+        "broker 可能只支援 MQTT 3.1（本程式預設 3.1.1）。",
+        "在 broker 端確認 protocol 設定；或改用支援 3.1.1 的 listener。",
+    ],
+    2: [
+        "MQTT 3.1 上限 23 字元且只允許 [0-9A-Za-z]；部分 broker 另有更嚴格限制。",
+        "也可能是多台用了同一個 client_id（同 id 會互踢，第二台起會被拒）。",
+        "確認每台的 RECEIVER_NO 或 hostname 不同 → 產生的 client_id 就會不同。",
+    ],
+    3: [
+        "broker 當下不可用（重啟中／過載）。稍後會自動重連。",
+    ],
+    4: [
+        "username / password 錯誤。檢查樹莓派上的 ~/beacons/my_secrets.py。",
+        "注意 password 若含特殊字元，deploy.sh 會用 json.dumps 跳脫，不會壞。",
+    ],
+    5: [
+        "帳號存在但沒有權限（ACL）。請在 broker 端確認該帳號可 publish/subscribe：",
+        "  <topic>/receivers/<n>、<topic>/status/<n>、<topic>/session_key",
+    ],
 }
 
 
@@ -204,12 +249,21 @@ def __mqtt_connect_handler(mqtt_client, userdata, flags, rc):
     if rc != 0:
         reason = MQTT_RC_MEANING.get(rc, "未知錯誤")
         print(f"❌ MQTT 連線被拒絕：RC={rc}（{reason}）")
-        print(f"     broker={MQTT_BROKER}:{MQTT_PORT} user={MQTT_USERNAME!r}")
-        print("     檢查 my_secrets.py 的 username/password，以及 broker 的 ACL 設定。")
+        print(f"     broker={MQTT_BROKER}:{MQTT_PORT} "
+              f"transport={MQTT_TRANSPORT} user={MQTT_USERNAME!r}")
+        print(f"     client_id={MQTT_CLIENT_ID!r}（長度 {len(MQTT_CLIENT_ID)}）")
+        for line in MQTT_RC_HINT.get(rc, []):
+            print(f"     → {line}")
+        if rc in (1, 2):
+            # 這兩種是「設定問題」，重連一萬次也不會好；不要讓使用者以為在等
+            print("     ⚠️ 這是設定問題，自動重連不會自行恢復，請修正後重啟服務：")
+            print("        sudo systemctl restart ble-beacon-scanner")
         return
 
     print("Successfully connected to MQTT broker.")
-    print("     Flags: {0}\n     RC: {1}".format(flags, rc))
+    if _mqtt_verbose:
+        print("     Flags: {0}\n     RC: {1}\n     client_id: {2}".format(
+            flags, rc, MQTT_CLIENT_ID))
 
     # 每次（重新）連線，paho 都會清掉訂閱記錄，所以這裡要重置旗標再訂閱。
     global _session_key_subscribe_pending, _session_key_subscribed, _session_key_received
